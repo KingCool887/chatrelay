@@ -1,0 +1,570 @@
+import { GIFT_WRAP_KIND, type Filter, type NostrEvent, tagFilterEntries } from "./nostr";
+import {
+  GROUP_SCOPE, CREATE_INVITE_KIND, GROUP_CHAT_KIND, type GroupScope, PUBLIC_SCOPE } from "./groups";
+
+// How many tag rows one `#<letter>` condition is allowed to look at, per
+// event the client asked for.
+//
+// A tag condition is resolved as `id IN (SELECT event_id FROM event_tags
+// WHERE ...)`, and until v0.7.7 that subquery was bounded by nothing at
+// all: it read every row carrying a named tag value, whatever the
+// filter's `limit`. Measured at E=1,000 with every event p-tagging the
+// owner, `{"#p":[owner],"limit":20}` read 4,000 rows -- and 4,000 again
+// at `limit: 1`. Flat in the limit, linear in the table. That made
+// limits.ts boundFilter structurally inert on the shape: halving a limit
+// that the cost does not depend on can neither clamp the filter nor ever
+// refuse it, so the one filter shape the read guard could not price was
+// also the one NIP-17 clients send on every connect (relay.ts
+// handleGiftWrap requires every gift wrap to p-tag the owner, which by
+// construction makes `#p:<owner>` the highest-cardinality tag value in
+// the table).
+//
+// Bounding the subquery is what makes the cost model in limits.ts true
+// rather than aspirational: `ORDER BY created_at DESC LIMIT n` against
+// idx_event_tags_lookup (tag_name, tag_value, created_at) streams the
+// index in the order the outer query already wants and stops, so the
+// cost becomes 4 x n and falls with the limit like every other admitted
+// shape. Measured, same fixture: 400 rows at `limit: 20`, 4 at
+// `limit: 1`.
+//
+// The depth is DERIVED, not chosen: at MAX_FILTER_LIMIT a single-value
+// tag filter should cost exactly the per-filter ceiling and no more, so
+//
+//   TAG_SCAN_DEPTH = MAX_FILTER_ROWS_READ / (TAG_ROWS_READ_PER_MATCH x MAX_FILTER_LIMIT)
+//                  = 10,000 / (4 x 500) = 5
+//
+// It lives here rather than in limits.ts with the other caps only because
+// limits.ts already imports this module; test/read-cost.test.ts asserts
+// the identity above against those three constants so the number cannot
+// go stale when one of them moves.
+//
+// What this trades away, stated plainly: completeness in one page. The
+// subquery returns the newest TAG_SCAN_DEPTH x limit tag rows, and any
+// other condition in the filter -- `kinds` most of all -- then narrows
+// what survives, so a client can be handed fewer events than it asked
+// for even though more exist. NIP-01 makes `limit` a maximum rather than
+// a quota (nips/01.md), so a short page is legal; what makes it workable
+// is the `since`/`until` pushdown below, which slides the window, so a
+// client paginating with `until` still walks the whole history, just in
+// smaller steps. The assumption underneath is density: a `#p:<owner>`
+// filter for kind 1059 is short-paged in proportion to how few of the
+// owner's p-tagged events are gift wraps, and on a personal relay whose
+// non-owner write traffic is mostly gift wraps that ratio is high. If it
+// ever is not, this constant is the dial -- and paying for it means
+// paying rows read, which is the ceiling that took this relay down.
+export const TAG_SCAN_DEPTH = 5;
+
+export function tagScanLimit(limit: number): number {
+  return limit * TAG_SCAN_DEPTH;
+}
+
+// The same budget, shared out across the partitions a single read covers
+// (FilterQueryOptions.tagScanDivisor). At least 1, so a divisor can never
+// silently turn a tag filter into one that looks at nothing.
+export function scopedTagScanLimit(limit: number, divisor = 1): number {
+  return Math.max(1, Math.ceil(tagScanLimit(limit) / Math.max(1, divisor)));
+}
+
+// Turns one REQ filter into a SQL query against the frozen schema
+// (schema.ts). Every query also excludes events whose `expiration` has
+// passed -- NIP-40 "SHOULD NOT send expired events to clients, even if
+// they are stored" (nips/40.md line 46).
+//
+// `#<letter>` conditions go through the `event_tags` index; ids/authors/
+// kinds go through equality/membership on `events` directly. No prefix
+// matching for ids/authors -- NIP-01 only says relays MAY support it, and
+// this suite doesn't require it (see docs/test-notes.md).
+export interface FilterQueryOptions {
+  // Omit kind-1059 rows from the result instead of returning them.
+  //
+  // This is the read gate on gift wraps for a session that is not
+  // authenticated as their recipient, and it is expressed as OMISSION
+  // rather than as refusal on purpose. The gate used to probe storage --
+  // re-run the filter restricted to kind 1059, refuse the REQ if
+  // anything came back -- and a refusal that depends on what is stored
+  // IS the answer to the question it refuses. An unauthenticated
+  // `{"#p":[owner],"since":S,"until":U,"limit":1}` got `auth-required`
+  // when a gift wrap fell inside the window and `EOSE` when none did, so
+  // bisecting since/until yielded exact arrival times and an exact inbox
+  // count, without the filter ever naming kind 1059. Omitting the rows
+  // answers the same filter the same way whether or not the inbox holds
+  // anything, which is the property the probe could not have.
+  //
+  // Applied only when the filter does not name `kinds` at all. A filter
+  // that names 1059 explicitly is refused by the caller (relay.ts
+  // handleReqInner) from `kinds` alone with no storage access -- refusing
+  // there leaks nothing, since the client already stated what it wanted
+  // -- and a filter naming other kinds cannot return a wrap anyway.
+  //
+  // What it costs, stated plainly, because it is the one place a query
+  // can read more than limits.ts filterReadCost prices it at. A skipped
+  // row is still a read row, so a filter whose matches are mostly gift
+  // wraps reads past them to reach what it may return. Two shapes, both
+  // measured at a 2,000-wrap inbox (test/read-cost.test.ts):
+  //
+  //   {"#p":[owner],"limit":20}       priced 400   reads 301   no overshoot
+  //   {"authors":[X],"limit":20}      priced  41   reads 2,002 bounded by
+  //                                                            the inbox
+  //
+  // The tag shape cannot overshoot: its subquery carries its own LIMIT
+  // (tagScanLimit above), so the candidate set is bounded before the
+  // exclusion applies. The index-driven shape can, up to the number of
+  // gift wraps the named author holds -- which is why limits.ts
+  // maxGiftWraps is now bounded by MAX_FILTER_ROWS_READ and not by the
+  // storage share alone. The price is a floor for that one shape; the
+  // ceiling is the inbox cap, and it is inside the per-filter cap by
+  // construction.
+  //
+  // NOT done in memory after the query, which would keep the price exact
+  // and would reintroduce the leak in a worse form: a client asking for
+  // 20 and receiving 8 has counted the gift wraps in its own window. The
+  // rows have to be gone before the LIMIT applies, or the LIMIT reports
+  // them.
+  excludeGiftWraps?: boolean;
+
+  // Omit kind-9009 create-invite rows from the result instead of
+  // returning them. The read gate on invite codes, for every session that
+  // is not the owner's -- see groups.ts CREATE_INVITE_KIND for why a
+  // member of the group is on the wrong side of it.
+  //
+  // Applied WHATEVER the filter's `kinds` says, which is the one place
+  // this differs from excludeGiftWraps above. A filter naming 1059 never
+  // reaches the SQL at all, because the caller refuses it from `kinds`
+  // alone; a filter naming 9009 is not refused -- refusal there would be
+  // a new signal on the unauthenticated path, where `{"kinds":[9009]}` is
+  // answered with a plain EOSE today -- so the exclusion is what has to
+  // answer it, and gating it on `kinds === undefined` would let the one
+  // filter that asks for invites by name straight through.
+  //
+  // Emitted on the public half of a two-partition read as well as the
+  // group half, where it can match nothing: a kind-9009 carries an `h`
+  // tag (nip29.ts refuses one that does not) and so is always a group
+  // event. That redundancy is deliberate -- a read gate that is correct
+  // only because the WRITE gate holds is a gate with a dependency nobody
+  // can see, and this codebase already pays a condition rather than take
+  // that trade (relay.ts refuses an h-tagged gift wrap by isGroupEvent,
+  // the same predicate the partition uses, rather than by a narrower
+  // rule that happens to agree today). It costs one bound parameter on
+  // reads by a member, and nothing at all on any other read: the caller
+  // sets it only for a session authorised for the group partition and not
+  // for the invites in it.
+  excludeInvites?: boolean;
+
+  // Which partition of `events` this query reads: the public rows, or one
+  // group's-worth of rows (src/groups.ts). Defaults to the public
+  // partition, which is what every unauthenticated read gets.
+  //
+  // Not optional in the SQL -- `is_group = ?` is emitted on EVERY query
+  // this function builds, and the same pin goes into every tag subquery.
+  // That is a hard requirement rather than an optimisation: schema.ts
+  // declares the three REQ-serving indexes as partial pairs keyed on this
+  // column, so a query naming no partition can use neither half of any
+  // pair and falls back to scanning `events`. Measured at 50,000 group
+  // events, an authenticated `{"kinds":[1],"limit":20}` with no pin read
+  // 92,033 rows; pinned, and run once per partition, it reads 82.
+  //
+  // A reader entitled to both partitions therefore runs the filter TWICE,
+  // once per scope -- storage.ts queryFilter merges and re-slices, exactly
+  // as it already does for the authors x kinds split expandFilter
+  // produces, and for the same reason: an index serves an ordered scan
+  // only when its key columns are pinned to one value each.
+  scope?: GroupScope;
+
+  // WHICH groups this reader may see, when `scope` is the group partition.
+  //
+  // The partition pin above answers "does reading this need a membership
+  // check"; this answers "and is this reader in THAT group". They are two
+  // questions because a relay hosts more than one group: a member of one
+  // is an authenticated non-owner to every other, and the partition alone
+  // cannot tell those apart -- it would hand a member of A everything in
+  // B, which is the whole of what per-group scoping has to prevent.
+  //
+  // `undefined` means unrestricted and is what the OWNER reads with. That
+  // is not a shortcut around the check but the correct answer for them,
+  // and it is worth being explicit about because it also happens to be
+  // the cheap one: the owner is in every group by construction, so an
+  // `IN` list naming them all would bind a parameter per group to express
+  // a condition that excludes nothing, and it would count against
+  // MAX_QUERY_BOUND_PARAMS on the one reader most likely to ask for a lot.
+  //
+  // An EMPTY array is not the same as `undefined` and must not be
+  // conflated with it: it means this reader may see no group at all, and
+  // it is the caller's job never to reach the group partition with one
+  // (relay.ts reads only PUBLIC_SCOPE in that case). Emitted as a
+  // condition that matches nothing rather than being dropped, so that a
+  // caller which gets there anyway fails closed.
+  groupIds?: readonly string[];
+
+  // How many partitions the caller is reading in total, used only to split
+  // the tag subquery's scan depth between them.
+  //
+  // Without it a two-partition read would scan tagScanLimit(limit) rows in
+  // each half and cost twice what limits.ts filterReadCost prices a tag
+  // filter at. With it the two halves share the budget, so the priced
+  // figure stays true whoever is asking -- and the split is not merely
+  // cost-neutral, it is what stops one busy partition starving the other:
+  // measured at 50,000 group events, the owner's own
+  // `{"#p":[owner],"kinds":[1059]}` returned ZERO gift wraps unsplit,
+  // because group tag rows filled the whole scan depth, and 16 with the
+  // depth split.
+  tagScanDivisor?: number;
+
+  // The oldest `created_at` a kind-9 chat message may be returned at
+  // (storage.ts chatHorizon, limits.ts CHAT_BACKLOG_SECONDS).
+  //
+  // Rule four of ephemeral chat: somebody arriving partway through a
+  // conversation sees the last few minutes of it, not the whole session.
+  // Everyone who was already in the room holds the rest from their own
+  // live subscription, so this withholds nothing from the people it was
+  // said to -- it bounds what a REQ can reach back for.
+  //
+  // FOLDED INTO `since` where it can be, and this is the difference
+  // between a saving and a cost. expandFilter has already split `kinds`
+  // into singletons by the time this function runs, so a query for the
+  // chat kind is a query with `kind = 9` pinned -- and the horizon is
+  // then just a tighter lower bound on the same index range
+  // idx_events_kind_created_grp already serves. Emitted instead as a
+  // residual `(kind != 9 OR created_at >= ?)`, it would bound nothing:
+  // ORDER BY created_at DESC walks back from the newest row, every row
+  // past the horizon fails the residual, and the scan would read the
+  // whole partition looking for a LIMIT it can never fill. That is the
+  // opposite of the point.
+  //
+  // The residual form is used only where there is no kind to pin -- a
+  // filter naming no `kinds` at all, where the query is not being served
+  // by the kind index anyway. It can overshoot exactly as
+  // excludeGiftWraps can, and is bounded the same way: by the tag
+  // subquery's own LIMIT on a tag-driven filter, and by the group's own
+  // chat volume otherwise.
+  //
+  // Set by relay.ts handleReqInner for every session, the owner's
+  // included. It is not a permission -- it is what the group's chat IS
+  // now -- so there is nobody to exempt.
+  chatHorizon?: number;
+}
+
+export function buildFilterQuery(
+  filter: Filter,
+  nowSec: number,
+  options: FilterQueryOptions = {},
+): { sql: string; params: unknown[] } | null {
+  const conditions: string[] = ["(expiration IS NULL OR expiration > ?)"];
+  const params: unknown[] = [nowSec];
+
+  // See FilterQueryOptions.chatHorizon. `filter.kinds` is a singleton or
+  // absent here -- expandFilter split it before this function was
+  // reached -- so "this query is for the chat kind" is one comparison,
+  // and where it holds the horizon becomes a lower bound on the index
+  // range rather than a condition applied to rows already read.
+  const horizon = options.chatHorizon;
+  const pinnedToChat = filter.kinds?.length === 1 && filter.kinds[0] === GROUP_CHAT_KIND;
+  const since =
+    horizon !== undefined && pinnedToChat
+      ? Math.max(filter.since ?? horizon, horizon)
+      : filter.since;
+
+  // The partition pin, on every query without exception -- see
+  // FilterQueryOptions.scope. Emitted before the filter's own conditions
+  // so it is impossible to build a query here that omits it.
+  conditions.push("is_group = ?");
+  params.push(options.scope ?? PUBLIC_SCOPE);
+
+  // Scoped to the groups this reader belongs to, on the group partition
+  // only -- a public row has no group_id and `IN` against NULL matches
+  // nothing, so emitting it there would silently return an empty result.
+  if ((options.scope ?? PUBLIC_SCOPE) === GROUP_SCOPE && options.groupIds !== undefined) {
+    if (options.groupIds.length === 0) {
+      conditions.push("0");
+    } else {
+      conditions.push(`group_id IN (${placeholders(options.groupIds.length)})`);
+      params.push(...options.groupIds);
+    }
+  }
+
+  if (filter.ids !== undefined) {
+    if (filter.ids.length === 0) return null;
+    conditions.push(`id IN (${placeholders(filter.ids.length)})`);
+    params.push(...filter.ids);
+  }
+  if (filter.authors !== undefined) {
+    if (filter.authors.length === 0) return null;
+    conditions.push(`pubkey IN (${placeholders(filter.authors.length)})`);
+    params.push(...filter.authors);
+  }
+  if (filter.kinds !== undefined) {
+    if (filter.kinds.length === 0) return null;
+    conditions.push(`kind IN (${placeholders(filter.kinds.length)})`);
+    params.push(...filter.kinds);
+  }
+  // See FilterQueryOptions.excludeGiftWraps. `kinds` absent only: with
+  // it present the caller has already settled the question, and adding a
+  // redundant `kind != ?` to every kinds-bearing query would price and
+  // plan for nothing.
+  if (options.excludeGiftWraps && filter.kinds === undefined) {
+    conditions.push("kind != ?");
+    params.push(GIFT_WRAP_KIND);
+  }
+  // See FilterQueryOptions.excludeInvites. Unconditional on `kinds`,
+  // unlike the gift wrap exclusion directly above, because a filter
+  // naming kind 9009 is answered by omission rather than refused.
+  if (options.excludeInvites) {
+    conditions.push("kind != ?");
+    params.push(CREATE_INVITE_KIND);
+  }
+  // The horizon where it could not be folded into `since` above: a filter
+  // naming no `kinds` at all, which asks for chat among everything else.
+  // A residual rather than a range bound, with the cost that implies --
+  // see FilterQueryOptions.chatHorizon.
+  if (horizon !== undefined && filter.kinds === undefined) {
+    conditions.push("(kind != ? OR created_at >= ?)");
+    params.push(GROUP_CHAT_KIND, horizon);
+  }
+  if (since !== undefined) {
+    conditions.push("created_at >= ?");
+    params.push(since);
+  }
+  if (filter.until !== undefined) {
+    conditions.push("created_at <= ?");
+    params.push(filter.until);
+  }
+  for (const [letter, values] of tagFilterEntries(filter)) {
+    if (values.length === 0) return null;
+    // The same partition pin as the outer query, and for a second reason
+    // on top of the index one: the subquery's LIMIT below runs BEFORE the
+    // outer query's conditions, so a candidate set that includes the other
+    // partition's rows is a candidate set that gets truncated by them.
+    // Measured, 50,000 group events, `{"#p":[owner],"limit":20}`: 20
+    // events returned with the pin, 1 without it.
+    const subConditions = [
+      "is_group = ?",
+      `tag_name = ? AND tag_value IN (${placeholders(values.length)})`,
+    ];
+    const subParams: unknown[] = [options.scope ?? PUBLIC_SCOPE, letter, ...values];
+    // The same scoping as the outer query, and needed here for the same
+    // reason the partition pin is: this subquery reads event_tags alone,
+    // so a tag row for a group the reader is not in would select an event
+    // id the outer query then fetches by primary key.
+    if ((options.scope ?? PUBLIC_SCOPE) === GROUP_SCOPE && options.groupIds !== undefined) {
+      if (options.groupIds.length === 0) {
+        subConditions.push("0");
+      } else {
+        subConditions.push(`group_id IN (${placeholders(options.groupIds.length)})`);
+        subParams.push(...options.groupIds);
+      }
+    }
+    // `since`/`until` are pushed down into the subquery, not left to the
+    // outer query. `event_tags.created_at` IS the event's own created_at
+    // (storage.ts insertEventRow copies it), so this is the same bound
+    // expressed against the index that serves the lookup -- it narrows
+    // the range scanned rather than discarding rows after they have been
+    // read, and it is what makes `until` pagination work underneath the
+    // LIMIT below.
+    if (since !== undefined) {
+      subConditions.push("created_at >= ?");
+      subParams.push(since);
+    }
+    if (filter.until !== undefined) {
+      subConditions.push("created_at <= ?");
+      subParams.push(filter.until);
+    }
+    let subquery = `SELECT event_id FROM event_tags WHERE ${subConditions.join(" AND ")}`;
+    if (filter.limit !== undefined) {
+      subquery += " ORDER BY created_at DESC LIMIT ?";
+      subParams.push(scopedTagScanLimit(filter.limit, options.tagScanDivisor));
+    }
+    conditions.push(`id IN (${subquery})`);
+    params.push(...subParams);
+  }
+
+  let sql = `SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC, id ASC`;
+  if (filter.limit !== undefined) {
+    sql += " LIMIT ?";
+    params.push(filter.limit);
+  }
+  return { sql, params };
+}
+
+function placeholders(count: number): string {
+  return Array(count).fill("?").join(", ");
+}
+
+// How many bound `?` parameters ONE buildFilterQuery call binds, for a
+// filter already split by expandFilter -- the shape buildFilterQuery
+// actually runs against, via storage.ts runFilterQuery, where `authors`
+// and `kinds` are each at most a single value. Needed by limits.ts
+// boundFilter BEFORE the query is built, for the same reason
+// expandFilterCount exists: the guard has to price a filter that might be
+// malicious before running anything that could BE the abuse.
+//
+// `ids` and each `#<letter>` tag's value list are NOT touched by
+// expandFilter, so unlike `authors`/`kinds` they carry their full length
+// into every query -- and limits.ts filterReadCost prices both of those by
+// ROWS READ, which is a different quantity from how many `?` placeholders
+// end up in the statement. `combinations x ids.length` rows read admits
+// thousands of ids at a small enough `limit`, and none of them shrink the
+// placeholder count, which is fixed the moment the filter is parsed. See
+// limits.ts MAX_QUERY_BOUND_PARAMS for what this bounds and why it exists.
+//
+// Mirrors buildFilterQuery's own accumulation term for term rather than
+// estimating it, so the two cannot drift the way the old
+// isUnconstrainedFilter/clampFilterLimit pair did -- test/read-limits.test.ts
+// asserts this against the real params.length of a built query.
+export function filterParamCount(filter: Filter): number {
+  // Counts the FILTER's own parameters and not the read gates'.
+  // excludeGiftWraps, excludeInvites and chatHorizon each add one or two
+  // more depending on the session asking, and none of them is visible to
+  // limits.ts boundFilter, which prices a filter before it knows who sent
+  // it. Four parameters at the very most, and MAX_QUERY_BOUND_PARAMS sits
+  // ten below SQLite's real ceiling for exactly this kind of slack.
+  let count = 1; // the "(expiration IS NULL OR expiration > ?)" guard on every query
+  count += 1; // the "is_group = ?" partition pin, also on every query
+  if (filter.ids !== undefined && filter.ids.length > 0) count += filter.ids.length;
+  if (filter.authors !== undefined && filter.authors.length > 0) count += 1;
+  if (filter.kinds !== undefined && filter.kinds.length > 0) count += 1;
+  if (filter.since !== undefined) count += 1;
+  if (filter.until !== undefined) count += 1;
+  for (const [, values] of tagFilterEntries(filter)) {
+    if (values.length === 0) continue;
+    count += 1; // the subquery's own "is_group = ?" pin
+    count += 1; // tag_name
+    count += values.length;
+    if (filter.since !== undefined) count += 1;
+    if (filter.until !== undefined) count += 1;
+    if (filter.limit !== undefined) count += 1; // tagScanLimit
+  }
+  if (filter.limit !== undefined) count += 1;
+  return count;
+}
+
+// Splits one filter into the cross-product of its `authors` x `kinds`
+// singletons, so every query that reaches SQLite pins each index key
+// column to ONE value.
+//
+// This is what turns limits.ts filterReadCost from an assertion into a
+// fact. An index can serve `ORDER BY created_at DESC LIMIT n` cheaply
+// only when the key columns ahead of `created_at` are pinned to a single
+// value each; `kind IN (1, 7)` pins nothing, so SQLite reads every
+// matching row and sorts it before LIMIT can discard any. Measured at
+// E=2,000 (test/read-cost.test.ts):
+//
+//   {"kinds":[1,7],"limit":20}            one query   3,983 rows
+//                                         split           82 rows
+//   {"authors":[owner],"kinds":[1,7]}     one query   3,584 rows
+//                                         split           42 rows
+//
+// Two queries at 41 rows each beat one query at 3,983, and the gap
+// widens linearly with the table. Splitting is also what makes the cost
+// PREDICTABLE rather than left to the query planner: measuring the
+// unsplit forms across candidate index sets produced answers that swung
+// between 41 and 3,584 for the same filter depending on which index
+// SQLite happened to choose. The split form costs
+// authors x kinds x (2 x limit) whichever index it picks.
+//
+// Only `authors` and `kinds` are expanded. `ids` is a primary-key seek
+// that needs no ordering at all and already costs one row per id, and a
+// `#<letter>` filter is resolved by a subquery against
+// idx_event_tags_lookup rather than by the ordered scan -- neither is
+// made cheaper by splitting, and both would multiply the query count for
+// nothing.
+//
+// Callers must re-merge: each sub-filter returns up to `limit` events of
+// its own, so the union can exceed what the client asked for. storage.ts
+// queryFilter dedupes, re-sorts and slices back to `limit`, which is what
+// keeps this an implementation detail rather than a protocol change --
+// NIP-01's `limit` is "the maximum number of events relays SHOULD return
+// in the initial query" (nips/01.md), and the split result set is
+// identical to the unsplit one.
+// How many queries expandFilter would produce, without producing them.
+//
+// limits.ts filterReadCost needs this count on every REQ filter from
+// every client, BEFORE anything has decided the filter is affordable, and
+// `authors` arrives off the wire uncapped (parseFilter does not bound it).
+// Materialising a ten-thousand-element cross-product to discover that it
+// is too expensive to run would be a cheap denial of service against the
+// guard that exists to prevent one. test/read-cost.test.ts asserts this
+// agrees with expandFilter, so the two cannot drift.
+export function expandFilterCount(filter: Filter): number {
+  return Math.max(1, filter.authors?.length ?? 1) * Math.max(1, filter.kinds?.length ?? 1);
+}
+
+export function expandFilter(filter: Filter): Filter[] {
+  const authors = filter.authors;
+  const kinds = filter.kinds;
+  // The common case by a wide margin -- nothing to expand, and the
+  // caller skips its merge entirely.
+  if ((authors?.length ?? 1) <= 1 && (kinds?.length ?? 1) <= 1) return [filter];
+
+  const expanded: Filter[] = [];
+  for (const author of authors ?? [undefined]) {
+    for (const kind of kinds ?? [undefined]) {
+      const sub: Filter = { ...filter };
+      if (author !== undefined) sub.authors = [author];
+      if (kind !== undefined) sub.kinds = [kind];
+      expanded.push(sub);
+    }
+  }
+  return expanded;
+}
+
+// Newest first, ties broken by lowest id -- the ordering
+// buildFilterQuery's `ORDER BY created_at DESC, id ASC` produces, stated
+// once here because both queryFilter (re-merging a split filter) and
+// queryFilters (ORing several filters) have to reproduce it exactly.
+export function compareEvents(a: NostrEvent, b: NostrEvent): number {
+  if (a.created_at !== b.created_at) return b.created_at - a.created_at;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+// In-memory equivalent of buildFilterQuery, used to test a single
+// freshly-stored event against a live subscription's filters without a
+// round trip through SQL.
+export function matchesFilter(event: NostrEvent, filter: Filter): boolean {
+  if (filter.ids !== undefined && !filter.ids.includes(event.id)) return false;
+  if (filter.authors !== undefined && !filter.authors.includes(event.pubkey)) return false;
+  if (filter.kinds !== undefined && !filter.kinds.includes(event.kind)) return false;
+  if (filter.since !== undefined && event.created_at < filter.since) return false;
+  if (filter.until !== undefined && event.created_at > filter.until) return false;
+  for (const [letter, values] of tagFilterEntries(filter)) {
+    const hasMatch = event.tags.some((t) => t[0] === letter && t[1] !== undefined && values.includes(t[1]));
+    if (!hasMatch) return false;
+  }
+  return true;
+}
+
+export function matchesAnyFilter(event: NostrEvent, filters: Filter[]): boolean {
+  return filters.some((f) => matchesFilter(event, f));
+}
+
+// Loose parse of a REQ filter object off the wire -- narrows to the
+// shape buildFilterQuery/matchesFilter expect without pulling in a full
+// schema validator for a single-user relay's own subscriptions.
+export function parseFilter(raw: unknown): Filter | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const filter: Filter = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === "ids" || key === "authors") {
+      if (!isStringArray(value)) return null;
+      filter[key] = value;
+    } else if (key === "kinds") {
+      if (!isNumberArray(value)) return null;
+      filter.kinds = value;
+    } else if (key === "since" || key === "until" || key === "limit") {
+      if (typeof value !== "number") return null;
+      filter[key] = value;
+    } else if (key.length === 2 && key[0] === "#") {
+      if (!isStringArray(value)) return null;
+      filter[key as `#${string}`] = value;
+    }
+    // Unknown keys are ignored per NIP-01 forward-compatibility.
+  }
+  return filter;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+function isNumberArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((v) => typeof v === "number");
+}
